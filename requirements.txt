@@ -1,0 +1,89 @@
+# =====================================================================
+# requirements.txt -- proyek bot trading Donchian / Chris Strategy
+#
+# Disusun dari HASIL SCAN import sungguhan di seluruh file .py proyek
+# ini, BUKAN daftar tebakan. Yang tidak benar-benar diimpor, tidak
+# dimasukkan.
+#
+# SENGAJA memakai batas minimum (>=), BUKAN pin versi persis (==).
+# Alasannya: environment Anda saat ini SUDAH BEKERJA dan botnya sedang
+# jalan -- memaksa versi persis bisa memicu downgrade/upgrade yang
+# justru merusak yang sudah benar. Pin persis baru masuk akal nanti
+# saat deploy ke mesin baru; cara membuatnya ada di catatan paling
+# bawah file ini.
+#
+# Python: >= 3.10 WAJIB. Kode memakai anotasi gaya `float | None` di
+# signature fungsi dan dataclass, yang dievaluasi saat runtime -- di
+# Python 3.9 ke bawah ini error, bukan cuma peringatan.
+# =====================================================================
+
+# --- Inti pengolahan data (dipakai di hampir semua file) -------------
+# pandas: 62 file. Seluruh pipeline bar/sinyal/backtest berdiri di atas
+#   DataFrame & Series.
+# numpy: 33 file. Perhitungan vektor, rolling, statistik.
+pandas>=2.0
+numpy>=1.24
+
+# --- Baca/tulis parquet ----------------------------------------------
+# Dibutuhkan pandas untuk read_parquet()/to_parquet() -- pandas TIDAK
+# bisa melakukannya sendiri tanpa engine. Dipakai di 8+ file:
+# fetch_klines.py, fetch_tick_data.py, volume_profile.py, footprint.py,
+# run_donchian_capital_backtest.py, run_paper_donchian_futures.py, dst.
+# Tanpa ini, seluruh alur data historis GAGAL -- termasuk --backfill-bars.
+pyarrow>=12.0
+
+# --- Koneksi bursa ---------------------------------------------------
+# ccxt: dipakai src/execution/broker.py (REST: order, saldo, posisi,
+#   riwayat trade) DAN src/data/stream.py (WebSocket, lewat `ccxt.pro`).
+#
+# WAJIB >= 4.0 karena dua alasan:
+#   1. Sejak ccxt 4.x, modul `ccxt.pro` sudah IKUT di paket utama --
+#      TIDAK perlu (dan TIDAK ADA) paket terpisah bernama "ccxtpro".
+#   2. fetch_positions() unified yang dipakai Broker.fetch_position()
+#      baru stabil di 4.x.
+ccxt>=4.0
+
+# --- Deteksi puncak (Market Profile) ---------------------------------
+# scipy.signal.find_peaks -- dipakai src/strategy/market_profile_levels.py
+# untuk menemukan puncak support/resistance dari KDE.
+# CATATAN: kalau Anda TIDAK memakai strategi Market Profile (bot
+# Donchian yang sedang jalan tidak memakainya), dependensi ini
+# sebenarnya opsional -- boleh dihapus kalau mau environment lebih
+# ramping.
+scipy>=1.10
+
+# --- Unduh data historis Binance gratis ------------------------------
+# Dipakai src/data/fetch_tick_data.py & fetch_klines.py untuk menarik
+# data dari data.binance.vision (aggTrades, klines). Menangani sniffing
+# header, deteksi epoch ms/µs, dan verifikasi checksum SHA-256.
+# CATATAN: cuma dipakai saat MENGUNDUH data baru. Bot yang sudah jalan
+# (live trading) TIDAK membutuhkannya.
+binance-vision
+
+# =====================================================================
+# TIDAK ADA di daftar ini -- dan itu disengaja:
+#
+# - scripts/dashboard_donchian.py: MURNI pustaka bawaan Python
+#   (http.server, json, subprocess, threading) + src.execution.broker.
+#   Sudah diverifikasi lewat scan AST: nol dependensi eksternal baru.
+#   Dashboard tidak menambah apa pun ke daftar ini.
+#
+# - Pustaka uji (pytest dsb): proyek ini memakai smoke test buatan
+#   sendiri yang dijalankan langsung (`python -m scripts.smoke_*`),
+#   tidak butuh framework uji apa pun.
+# =====================================================================
+
+# =====================================================================
+# CARA PAKAI
+#
+#   pip install -r requirements.txt
+#
+# CARA MEMBUAT PIN VERSI PERSIS (untuk deploy ke mesin/VPS baru):
+# Jalankan ini DI KOMPUTER YANG BOT-NYA SUDAH TERBUKTI JALAN --
+# hasilnya merekam versi yang BENAR-BENAR bekerja, bukan versi terbaru
+# yang belum teruji di proyek ini:
+#
+#   pip freeze > requirements-lock.txt
+#
+# Lalu di mesin baru pakai requirements-lock.txt itu, bukan file ini.
+# =====================================================================

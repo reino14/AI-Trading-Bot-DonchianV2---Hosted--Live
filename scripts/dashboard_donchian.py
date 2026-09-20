@@ -353,7 +353,7 @@ class DashboardState:
     def _ensure_broker(self):
         if self._broker is None:
             from src.execution.broker import Broker
-            self._broker = Broker(exchange_id="binanceusdm", testnet=True)
+            self._broker = Broker(exchange_id="binanceusdm", testnet=False)
         return self._broker
 
     def refresh_once(self) -> None:

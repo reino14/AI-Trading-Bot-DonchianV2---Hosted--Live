@@ -109,7 +109,7 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         broker = MockBroker(fill_immediately=True)
         print("  (Broker: MockBroker -- TIDAK menyentuh jaringan sama sekali)")
     else:
-        broker = Broker(exchange_id="binanceusdm", testnet=True)
+        broker = Broker(exchange_id="binanceusdm", testnet=False)
         print("  (Broker: Binance Demo Trading, futures -- demo-fapi.binance.com)")
 
     if args.take_profit_pct is not None:
