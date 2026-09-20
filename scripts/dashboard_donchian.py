@@ -34,7 +34,7 @@ broker.py yang dipakai bot yang sedang jalan.
 
 Cara pakai:
     python -m scripts.dashboard_donchian
-lalu buka http://localhost:8100
+lalu buka http://localhost:8200
 """
 
 from __future__ import annotations
@@ -776,7 +776,7 @@ def main() -> None:
     p.add_argument("--symbol", default="BTC/USDT:USDT")
     p.add_argument("--timeframe", default="1m")
     p.add_argument("--lookback", type=int, default=200)
-    p.add_argument("--port", type=int, default=8100)
+    p.add_argument("--port", type=int, default=8200)
     p.add_argument("--refresh-seconds", type=float, default=5.0)
     p.add_argument("--history-days", type=int, default=30,
                     help="berapa hari riwayat trade ditarik dari bursa untuk difilter di dashboard")
