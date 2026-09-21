@@ -250,6 +250,44 @@ class Broker:
                 }
         return None
 
+    def place_take_profit_market(self, symbol: str, position_side: str, stop_price: float) -> str:
+        """
+        Titipkan order TAKE_PROFIT_MARKET ke BURSA -- begitu harga
+        menyentuh stop_price, yang mengeksekusi adalah mesin matching
+        Binance, BUKAN bot ini. Tidak ada polling, tidak ada jendela
+        buta antar-cek, dan TETAP jalan meski program ini mati atau
+        koneksinya putus.
+
+        position_side: "long"/"short" -- arah posisi yang sedang
+            dipegang (BUKAN sisi order penutupnya). Sisi ordernya
+            diturunkan di sini supaya caller tidak perlu ingat
+            membalik sendiri.
+
+        closePosition=True: menutup SELURUH posisi berapa pun
+            besarnya, jadi `amount` tidak perlu dihitung dan tidak bisa
+            salah hitung. Binance juga otomatis membatalkan order
+            seperti ini begitu posisi jadi nol -- PERILAKU INI BELUM
+            SAYA VERIFIKASI di akun Demo Anda, wajib dicek langsung:
+            buka posisi, tutup manual lewat sinyal, lalu lihat apakah
+            order kondisionalnya benar-benar hilang dari open orders.
+
+        workingType=CONTRACT_PRICE: pakai harga LAST, sama dengan yang
+            dipakai fetch_current_price() -- supaya ambang di bursa
+            konsisten dengan perhitungan internal bot. Default Binance
+            adalah MARK_PRICE yang bisa beda beberapa puluh dolar dari
+            last, artinya TP bisa terpicu di ROI yang bukan Anda minta.
+
+        Return: id order di bursa -- disimpan caller supaya bisa
+        dibatalkan manual kalau perlu.
+        """
+        side = "sell" if position_side == "long" else "buy"
+        order = self.exchange.create_order(
+            symbol, type="TAKE_PROFIT_MARKET", side=side, amount=None,
+            params={"stopPrice": stop_price, "closePosition": True,
+                    "workingType": "CONTRACT_PRICE"},
+        )
+        return order["id"]
+
     def fetch_trading_fee_pct(self, symbol: str) -> float | None:
         """
         Ambil taker fee SATU SISI (bukan bolak-balik) untuk symbol ini,
@@ -345,6 +383,7 @@ class MockBroker:
         self._historical_bars = historical_bars or []  # untuk uji fetch_recent_bars()/backfill
         self.taker_fee_pct = taker_fee_pct  # untuk uji fetch_trading_fee_pct()
         self._current_price: float | None = None  # untuk uji fetch_current_price()
+        self._take_profit_orders: dict[str, dict] = {}  # untuk uji place_take_profit_market()
 
     def set_current_price(self, price: float) -> None:
         """Bantuan uji -- set harga yang akan dikembalikan fetch_current_price() berikutnya."""
@@ -367,6 +406,22 @@ class MockBroker:
         """Padanan Broker.fetch_recent_bars() -- kembalikan bar tiruan yang di-set lewat konstruktor."""
         self._check_network()
         return self._historical_bars[-limit:]
+
+    def place_take_profit_market(self, symbol: str, position_side: str, stop_price: float) -> str:
+        """
+        Padanan Broker.place_take_profit_market() -- WAJIB ada di sini
+        juga, kalau tidak jalur --mock akan AttributeError begitu
+        posisi dibuka dengan take-profit aktif. Cuma MENCATAT, tidak
+        mensimulasikan pemicuannya (MockBroker tidak punya konsep
+        "harga bergerak sendiri") -- cukup untuk memverifikasi bahwa
+        pipa pemasangannya jalan dan harga triggernya benar.
+        """
+        self._check_network()
+        order_id = f"mock-tp-{uuid.uuid4().hex[:12]}"
+        self._take_profit_orders[order_id] = {
+            "symbol": symbol, "position_side": position_side, "stop_price": stop_price,
+        }
+        return order_id
 
     def simulate_network_down(self) -> None:
         self._network_up = False

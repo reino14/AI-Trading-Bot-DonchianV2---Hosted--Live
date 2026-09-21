@@ -111,6 +111,7 @@ class PaperRunner:
         self._entry_price: float | None = None
         self._entry_leverage: float = 1.0
         self._entry_taker_fee_pct: float = 0.0005  # fallback KONSERVATIF (0,05%) -- ditimpa dari bursa saat posisi dibuka
+        self._tp_order_id: str | None = None  # id order TAKE_PROFIT_MARKET yang dititipkan ke bursa
         self._blocked_direction: int | None = None
         self._trading_halted: bool = False
         self._last_order_info: dict | None = None  # {"client_order_id", "target_position"} -- lihat _sync_position_from_exchange
@@ -786,6 +787,7 @@ class PaperRunner:
                 self._entry_price = None  # posisi ditutup -- tidak ada entry aktif lagi
                 self._entry_leverage = 1.0
                 self._entry_taker_fee_pct = 0.0005  # kembali ke fallback konservatif
+                self._tp_order_id = None  # posisi tutup -- id TP lama tidak relevan lagi
             else:
                 # posisi BARU dibuka -- catat harga eksekusi SUNGGUHAN
                 # (average_price), bukan harga limit yang diminta,
@@ -821,6 +823,36 @@ class PaperRunner:
                 except Exception as e:
                     print(f"  [signal] gagal ambil fee dari bursa ({e}) -- pakai fallback "
                           f"{self._entry_taker_fee_pct:.3%}")
+
+                # Titipkan TAKE-PROFIT ke BURSA -- dipasang DI SINI,
+                # setelah _entry_price/_entry_leverage/_entry_taker_fee_pct
+                # ketiganya sudah terisi, karena harga triggernya
+                # diturunkan dari ketiganya. Dipasang lebih awal =
+                # dihitung dari angka yang belum final.
+                #
+                # Rumusnya adalah KEBALIKAN _net_roi_pct(): cari harga
+                # yang membuat net_roi PERSIS sama dengan take_profit_pct.
+                #   net = raw*L - 2*f*L >= TP   ->   raw >= TP/L + 2*f
+                # Perhatikan suku fee TIDAK ikut terbagi leverage.
+                if self.take_profit_pct is not None:
+                    direction = 1 if target_after_this_order == Position.LONG else -1
+                    move = self.take_profit_pct / self._entry_leverage + 2 * self._entry_taker_fee_pct
+                    tp_price = self._entry_price * (1 + direction * move)
+                    try:
+                        self._tp_order_id = self.broker.place_take_profit_market(
+                            self.symbol, "long" if direction == 1 else "short", tp_price)
+                        print(f"  [take-profit] dititipkan ke BURSA di {tp_price:.2f} "
+                              f"({move:+.4%} dari entry {self._entry_price:.2f}) -- "
+                              f"Binance yang eksekusi, bukan bot ini. id={self._tp_order_id}")
+                    except Exception as e:
+                        # JANGAN diam -- kalau titip gagal, satu-satunya
+                        # pengaman yang tersisa adalah pemantauan internal,
+                        # dan itu cuma jalan kalau --live-take-profit-poll-seconds
+                        # diisi. Tanpa keduanya, posisi ini TIDAK punya TP sama sekali.
+                        self._tp_order_id = None
+                        print(f"  [take-profit] GAGAL titip ke bursa ({e}) -- posisi ini "
+                              f"bergantung sepenuhnya pada pemantauan internal. Pastikan "
+                              f"--live-take-profit-poll-seconds aktif, kalau tidak posisi ini TANPA TP.")
         # kalau partial/open/rejected: posisi belum berubah penuh,
         # dibiarkan -- bar berikutnya mengevaluasi ulang otomatis.
 
