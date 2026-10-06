@@ -169,8 +169,12 @@ class Broker:
         raw_orders = self.exchange.fetch_open_orders(symbol)
         return [self._normalize_order(o, o.get("clientOrderId", o.get("id", ""))) for o in raw_orders]
 
-    def fetch_position(self, symbol: str) -> dict | None:
+    def fetch_position(self, symbol: str, quiet: bool = False) -> dict | None:
         """
+        quiet=True: tidak mencetak baris diagnosa [fetch_position]. Dipakai
+        pemantau SL/TP yang memanggil ini tiap beberapa detik -- tanpa ini,
+        log bot kebanjiran baris yang sama. Default False = perilaku lama.
+
         Ambil posisi SUNGGUHAN saat ini dari bursa (khusus futures --
         spot tidak punya konsep "posisi" sama sekali, cuma saldo
         wallet). Dipakai untuk REKONSILIASI: kalau sebuah order tidak
@@ -203,7 +207,8 @@ class Broker:
                     raw_leverage = info.get("leverage")
                     if raw_leverage is not None:
                         leverage = float(raw_leverage)
-                        print(f"  [fetch_position] field unified 'leverage' kosong, tapi ketemu "
+                        if not quiet:
+                            print(f"  [fetch_position] field unified 'leverage' kosong, tapi ketemu "
                               f"di respons mentah bursa (info.leverage={raw_leverage}) -- dipakai itu.")
 
                 if leverage is None:
@@ -221,13 +226,15 @@ class Broker:
                         initial_margin = float(info.get("initialMargin", 0) or 0)
                         if initial_margin > 0:
                             leverage = abs(notional) / initial_margin
-                            print(f"  [fetch_position] leverage dihitung dari notional/initialMargin "
+                            if not quiet:
+                                print(f"  [fetch_position] leverage dihitung dari notional/initialMargin "
                                   f"= {leverage:.2f}x (field langsung tidak tersedia dari bursa).")
                     except (TypeError, ValueError):
                         pass
 
                 if leverage is None:
-                    print(f"  [fetch_position] PERINGATAN: leverage tidak bisa ditentukan sama sekali "
+                    if not quiet:
+                        print(f"  [fetch_position] PERINGATAN: leverage tidak bisa ditentukan sama sekali "
                           f"(field langsung maupun turunan notional/margin) untuk {symbol} -- pakai "
                           f"fallback 1.0 (take-profit berbasis ROI akan butuh pergerakan harga lebih "
                           f"besar dari seharusnya).")
@@ -287,6 +294,106 @@ class Broker:
                     "workingType": "CONTRACT_PRICE"},
         )
         return order["id"]
+
+    def place_stop_market(self, symbol: str, position_side: str, trigger_price: float) -> str:
+        """
+        Titipkan STOP LOSS (STOP_MARKET, closePosition) ke BURSA. Padanan
+        place_take_profit_market(), arah pemicunya saja yang berlawanan.
+        Tetap melindungi posisi walau bot atau VPS mati.
+
+        Sejak 2025-12-09 Binance USD-M memindahkan order bersyarat ke
+        endpoint Algo (/fapi/v1/algoOrder) yang memakai `triggerPrice`.
+        Diverifikasi offline dengan ccxt 4.5.78: order ini diarahkan ke
+        endpoint Algo dan dikirim dengan `triggerPrice`. ccxt versi lama
+        mengirimnya ke endpoint lama dan DITOLAK (error -4120) -- gagal
+        dengan suara, bukan diam-diam, dan PaperRunner menutup posisi kalau
+        SL gagal terpasang. Nama `triggerPrice` sengaja dipakai di sini.
+        """
+        side = "sell" if position_side == "long" else "buy"
+        order = self.exchange.create_order(
+            symbol, type="STOP_MARKET", side=side, amount=None,
+            params={"triggerPrice": trigger_price, "closePosition": True,
+                    "workingType": "CONTRACT_PRICE"},
+        )
+        return str(order["id"])
+
+    def fetch_open_conditional_orders(self, symbol: str) -> list[dict]:
+        """
+        Daftar order BERSYARAT (SL/TP) yang masih terbuka di bursa.
+
+        PENTING: fetch_open_orders() biasa TIDAK membaca order bersyarat
+        sejak migrasi Algo -- keduanya endpoint berbeda (diverifikasi offline).
+        Karena itu cancel_open_orders() di OrderManager tidak pernah
+        membatalkan TP/SL yang tersisa; method ini yang menutup celah itu.
+
+        Jenis order diambil dari data MENTAH `info.orderType`, bukan
+        field `type` ccxt: ccxt menyamaratakan STOP_MARKET dan
+        TAKE_PROFIT_MARKET jadi 'market' (diverifikasi offline), sehingga
+        SL dan TP tidak bisa dibedakan dari field itu.
+
+        Return: [{"id", "type" ("STOP_MARKET"/"TAKE_PROFIT_MARKET"/...),
+                  "side", "trigger_price" (None kalau bursa tidak mengisinya)}]
+        """
+        raw = self.exchange.fetch_open_orders(symbol, params={"trigger": True})
+        out = []
+        for o in raw:
+            info = o.get("info") or {}
+            trig = o.get("triggerPrice") or o.get("stopPrice") or info.get("triggerPrice") or info.get("stopPrice")
+            try:
+                trig = float(trig) if trig not in (None, "") else None
+            except (TypeError, ValueError):
+                trig = None
+            out.append({
+                "id": str(o.get("id") or info.get("algoId") or ""),
+                "type": str(info.get("orderType") or info.get("type") or o.get("type") or "").upper(),
+                "side": o.get("side"),
+                "trigger_price": trig if trig else None,
+            })
+        return out
+
+    def cancel_conditional_orders(self, symbol: str) -> int:
+        """Batalkan SEMUA order bersyarat (SL/TP) untuk simbol ini. Return jumlahnya."""
+        orders = self.fetch_open_conditional_orders(symbol)
+        for o in orders:
+            self.exchange.cancel_order(o["id"], symbol, params={"trigger": True})
+        return len(orders)
+
+    def fetch_realized_pnl_since(self, symbol: str, since_ms: int, max_pages: int = 20) -> dict:
+        """
+        Total realized PnL dan fee sejak `since_ms`, dari riwayat fill akun
+        (sumber yang sama dengan angka "Bersih" di dashboard). Dipakai kill
+        switch rugi harian. Return {"realized", "fee", "n"}.
+        """
+        realized = fee = 0.0
+        n, cursor, seen = 0, since_ms, set()
+        for _ in range(max_pages):
+            batch = self.exchange.fetch_my_trades(symbol, since=cursor, limit=1000)
+            if not batch:
+                break
+            maju = cursor
+            for t in batch:
+                tid = t.get("id") or f"{t.get('timestamp')}-{t.get('order')}-{t.get('amount')}"
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                info = t.get("info") or {}
+                realized += float(info.get("realizedPnl") or 0)
+                biaya = (t.get("fee") or {}).get("cost")
+                fee += float(biaya if biaya not in (None, "") else info.get("commission") or 0)
+                n += 1
+                maju = max(maju, int(t.get("timestamp") or 0))
+            if len(batch) < 1000 or maju <= cursor:
+                break
+            cursor = maju + 1
+        return {"realized": realized, "fee": fee, "n": n}
+
+    def fetch_last_fill_price(self, symbol: str) -> float | None:
+        """Harga fill TERAKHIR di akun untuk simbol ini -- dipakai menebak SL atau TP yang kena."""
+        trades = self.exchange.fetch_my_trades(symbol, limit=5)
+        if not trades:
+            return None
+        last = sorted(trades, key=lambda t: t.get("timestamp") or 0)[-1]
+        return float(last["price"]) if last.get("price") is not None else None
 
     def fetch_trading_fee_pct(self, symbol: str) -> float | None:
         """
@@ -384,6 +491,17 @@ class MockBroker:
         self.taker_fee_pct = taker_fee_pct  # untuk uji fetch_trading_fee_pct()
         self._current_price: float | None = None  # untuk uji fetch_current_price()
         self._take_profit_orders: dict[str, dict] = {}  # untuk uji place_take_profit_market()
+        # Order bersyarat yang masih TERBUKA (SL & TP), meniru endpoint Algo.
+        self._conditional_orders: dict[str, dict] = {}
+        self._last_fill_price: float | None = None
+        # Realized PnL & fee per fill (untuk kill switch rugi harian), dan
+        # nilai paksaan untuk uji: kalau diisi, dipakai apa adanya.
+        self._realized_log: list[dict] = []
+        self.realized_override: dict | None = None
+        # Bantuan uji kegagalan: SL ditolak bursa, atau bursa "menerima"
+        # SL tapi mengabaikan harga pemicunya (jebakan stopPrice/triggerPrice).
+        self.fail_stop_orders = False
+        self.drop_stop_trigger_price = False
 
     def set_current_price(self, price: float) -> None:
         """Bantuan uji -- set harga yang akan dikembalikan fetch_current_price() berikutnya."""
@@ -421,7 +539,63 @@ class MockBroker:
         self._take_profit_orders[order_id] = {
             "symbol": symbol, "position_side": position_side, "stop_price": stop_price,
         }
+        self._conditional_orders[order_id] = {
+            "symbol": symbol, "type": "TAKE_PROFIT_MARKET",
+            "side": "sell" if position_side == "long" else "buy", "trigger_price": stop_price,
+        }
         return order_id
+
+    def place_stop_market(self, symbol: str, position_side: str, trigger_price: float) -> str:
+        """Padanan Broker.place_stop_market()."""
+        self._check_network()
+        if self.fail_stop_orders:
+            raise RuntimeError("MockBroker: simulasi SL ditolak bursa (-4120)")
+        order_id = f"mock-sl-{uuid.uuid4().hex[:12]}"
+        self._conditional_orders[order_id] = {
+            "symbol": symbol, "type": "STOP_MARKET",
+            "side": "sell" if position_side == "long" else "buy",
+            "trigger_price": None if self.drop_stop_trigger_price else trigger_price,
+        }
+        return order_id
+
+    def fetch_open_conditional_orders(self, symbol: str) -> list[dict]:
+        """Padanan Broker.fetch_open_conditional_orders()."""
+        self._check_network()
+        return [{"id": oid, "type": o["type"], "side": o["side"], "trigger_price": o["trigger_price"]}
+                for oid, o in self._conditional_orders.items() if o["symbol"] == symbol]
+
+    def cancel_conditional_orders(self, symbol: str) -> int:
+        """Padanan Broker.cancel_conditional_orders()."""
+        self._check_network()
+        ids = [oid for oid, o in self._conditional_orders.items() if o["symbol"] == symbol]
+        for oid in ids:
+            del self._conditional_orders[oid]
+        return len(ids)
+
+    def fetch_realized_pnl_since(self, symbol: str, since_ms: int) -> dict:
+        """Padanan Broker.fetch_realized_pnl_since()."""
+        self._check_network()
+        if self.realized_override is not None:
+            return dict(self.realized_override)
+        rows = [r for r in self._realized_log if r["ts"] >= since_ms]
+        return {"realized": sum(r["pnl"] for r in rows), "fee": sum(r["fee"] for r in rows), "n": len(rows)}
+
+    def fetch_last_fill_price(self, symbol: str) -> float | None:
+        """Padanan Broker.fetch_last_fill_price()."""
+        self._check_network()
+        return self._last_fill_price
+
+    def simulate_conditional_trigger(self, order_id: str, fill_price: float) -> None:
+        """
+        Bantuan uji: order bersyarat terpicu dan menutup SELURUH posisi di
+        fill_price. Order pasangannya SENGAJA dibiarkan terbuka -- apakah
+        Binance membatalkannya otomatis belum terverifikasi, jadi bot harus
+        membatalkannya sendiri, dan uji inilah yang membuktikannya.
+        """
+        o = self._conditional_orders.pop(order_id)
+        pos = self._positions.get(o["symbol"])
+        if pos and pos["side"]:
+            self._apply_fill_to_position(o["symbol"], o["side"], pos["contracts"], fill_price)
 
     def simulate_network_down(self) -> None:
         self._network_up = False
@@ -447,8 +621,18 @@ class MockBroker:
         rata-rata tertimbang). Cukup untuk uji skenario "satu posisi,
         satu entry" yang dipakai proyek ini.
         """
+        self._last_fill_price = price
         current = self._positions.get(symbol, {"side": None, "contracts": 0.0, "entry_price": None})
         was_long, was_short = current["side"] == "long", current["side"] == "short"
+        tutup = 0.0
+        if (was_long and side == "sell") or (was_short and side == "buy"):
+            tutup = min(current["contracts"], amount)
+        pnl = 0.0
+        if tutup and current.get("entry_price"):
+            pnl = (price - current["entry_price"]) * tutup * (1 if was_long else -1)
+        import time as _t
+        self._realized_log.append({"ts": int(_t.time() * 1000), "pnl": pnl,
+                                   "fee": amount * price * (self.taker_fee_pct or 0.0005)})
         signed = current["contracts"] if was_long else -current["contracts"] if was_short else 0.0
         signed += amount if side == "buy" else -amount
 
@@ -530,7 +714,7 @@ class MockBroker:
         self._check_network()
         return [o for o in self._orders.values() if not o.is_terminal and o.symbol == symbol]
 
-    def fetch_position(self, symbol: str) -> dict | None:
+    def fetch_position(self, symbol: str, quiet: bool = False) -> dict | None:
         """Padanan Broker.fetch_position() -- lihat docstring di sana."""
         self._check_network()
         pos = self._positions.get(symbol)

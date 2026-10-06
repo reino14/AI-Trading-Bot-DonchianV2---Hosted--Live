@@ -31,11 +31,34 @@ reduceOnly lagi -- DITOLAK bursa karena memang tidak ada apa-apa lagi
 untuk dikurangi. Perbaikannya: cek fetch_position() ke bursa dulu
 SEBELUM memutuskan aksi, bukan cuma percaya status yang dilihat sesaat
 saat order dulu dikirim.
+
+FITUR SL + TP RASIO (risk_reward, mis. 2.0) -- MATI secara default
+-------------------------------------------------------------------------
+Kalau risk_reward diisi, begitu posisi terbuka bot menitipkan DUA order
+bersyarat ke BURSA (bukan dipantau bot):
+  - STOP LOSS  : jarak = maks(sl_atr_mult x ATR, sl_min_fee_mult x fee
+                 bolak-balik). ATR = rata-rata true range `sl_atr_period`
+                 bar dari timeframe bot (aturan 2N sistem Turtle).
+  - TAKE PROFIT: jarak = R x SL + (R+1) x fee bolak-balik, supaya UANG
+                 BERSIH setelah fee benar-benar R:1 (bukan cuma jarak harga).
+Keduanya tetap melindungi posisi walau bot/VPS mati. SL diverifikasi ke
+bursa setelah dipasang; kalau gagal dipasang atau tidak lolos verifikasi,
+posisi DITUTUP SEGERA dan bot berhenti membuka posisi baru -- posisi
+tidak pernah dibiarkan terbuka tanpa SL.
+Saat posisi ditutup lewat jalur apa pun, sisa order bersyarat DIBATALKAN
+eksplisit (tidak mengandalkan pembatalan otomatis bursa, yang belum
+terverifikasi). Setelah SL kena, arah itu DITAHAN sampai sinyal berbalik.
+Setelah TP kena, berlaku aturan stop_after_take_profit yang sudah ada.
+Tanpa risk_reward, perilaku bot SAMA PERSIS dengan sebelumnya.
 """
 
 import asyncio
+import json
+import os
+import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -46,7 +69,118 @@ from src.execution.slippage_tracker import SignalContext, SlippageTracker
 from src.strategy.base import Position, Strategy
 
 
+def compute_atr(bars: list[dict], period: int) -> float | None:
+    """
+    ATR = rata-rata true range `period` bar terakhir (tanpa smoothing).
+    True range = maks(high-low, |high-close_sebelumnya|, |low-close_sebelumnya|).
+    None kalau bar belum cukup. FUNGSI MURNI.
+    """
+    if period <= 0 or len(bars) < period + 1:
+        return None
+    recent = bars[-(period + 1):]
+    trs = []
+    for prev, cur in zip(recent[:-1], recent[1:]):
+        h, lo, pc = float(cur["high"]), float(cur["low"]), float(prev["close"])
+        trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+    return sum(trs) / len(trs)
+
+
+def compute_bracket(entry: float, direction: int, atr: float | None, fee_side: float,
+                    rr: float, atr_mult: float, min_fee_mult: float) -> dict:
+    """
+    Hitung harga SL & TP. FUNGSI MURNI. Semua jarak dalam FRAKSI harga.
+
+      f  = fee bolak-balik = 2 x fee satu sisi
+      s  = maks(atr_mult x ATR / entry, min_fee_mult x f)   (jarak SL)
+      t  = rr x s + (rr + 1) x f                             (jarak TP)
+
+    Kenapa rumus TP begitu: rugi bersih saat SL = s + f, untung bersih saat
+    TP = t - f. Syarat untung bersih = rr x rugi bersih memberi
+    t - f = rr(s + f)  ->  t = rr x s + (rr + 1) x f.
+    Leverage tidak muncul: untung, rugi, dan fee sama-sama dikali leverage,
+    jadi rasionya tidak berubah.
+    """
+    fee_rt = 2 * fee_side
+    floor = min_fee_mult * fee_rt
+    atr_dist = (atr_mult * atr / entry) if (atr and entry) else None
+    if atr_dist is not None and atr_dist >= floor:
+        s, basis = atr_dist, f"{atr_mult:g}xATR"
+    else:
+        s = floor
+        basis = f"batas bawah {min_fee_mult:g}x fee" + (" (ATR lebih kecil)" if atr_dist is not None
+                                                       else " (ATR belum tersedia)")
+    t = rr * s + (rr + 1) * fee_rt
+    return {
+        "entry": entry, "direction": direction, "atr": atr, "fee_rt": fee_rt, "rr": rr,
+        "sl_dist": s, "tp_dist": t, "sl_basis": basis,
+        "sl_price": entry * (1 - direction * s),
+        "tp_price": entry * (1 + direction * t),
+    }
+
+
+def compute_bracket_roi(entry: float, direction: int, leverage: float | None, tp_roi: float,
+                        sl_roi: float, fee_side: float) -> dict:
+    """
+    SL & TP dari ROI KOTOR terhadap MARGIN (definisi yang sama dengan
+    ROI di aplikasi Binance). FUNGSI MURNI.
+
+      gerak harga = ROI / leverage      (mis. ROI 5% di 20x -> harga 0,25%)
+      untung bersih TP = t - f,  rugi total SL = s + f   (f = fee bolak-balik)
+
+    Fee dibayar di KEDUA hasil, jadi rasio bersih (rr) biasanya jauh lebih
+    kecil dari tp_roi / sl_roi. rr dikembalikan supaya bisa ditampilkan.
+    """
+    lev = leverage if leverage and leverage > 0 else 1.0
+    fee_rt = 2 * fee_side
+    s, t = sl_roi / lev, tp_roi / lev
+    rugi, untung = s + fee_rt, t - fee_rt
+    return {
+        "entry": entry, "direction": direction, "atr": None, "fee_rt": fee_rt, "leverage": lev,
+        "tp_roi": tp_roi, "sl_roi": sl_roi, "sl_dist": s, "tp_dist": t,
+        "rr": (untung / rugi) if rugi > 0 else None,
+        "sl_basis": f"ROI kotor {sl_roi:.2%} / {lev:g}x",
+        "sl_price": entry * (1 - direction * s),
+        "tp_price": entry * (1 + direction * t),
+    }
+
+
+def classify_bracket_exit(exit_price: float | None, bracket: dict) -> str:
+    """'TP', 'SL', atau 'UNKNOWN' -- pemicu mana yang paling dekat dengan harga keluar."""
+    if exit_price is None:
+        return "UNKNOWN"
+    kandidat = [(k, bracket.get(f"{k.lower()}_price")) for k in ("TP", "SL")]
+    kandidat = [(k, v) for k, v in kandidat if v]
+    if not kandidat:
+        return "UNKNOWN"
+    return min(kandidat, key=lambda kv: abs(exit_price - kv[1]))[0]
+
+
 class PaperRunner:
+    # ------------------------------------------------------------------
+    # Dua status ini disimpan ke file tiap kali berubah (lihat state_path).
+    # ------------------------------------------------------------------
+    @property
+    def _blocked_direction(self):
+        return getattr(self, "_blocked_direction_v", None)
+
+    @_blocked_direction.setter
+    def _blocked_direction(self, v):
+        lama = getattr(self, "_blocked_direction_v", None)
+        self._blocked_direction_v = v
+        if v != lama:
+            self._persist_state()
+
+    @property
+    def _reentry_armed(self):
+        return getattr(self, "_reentry_armed_v", False)
+
+    @_reentry_armed.setter
+    def _reentry_armed(self, v):
+        lama = getattr(self, "_reentry_armed_v", False)
+        self._reentry_armed_v = bool(v)
+        if bool(v) != lama:
+            self._persist_state()
+
     def __init__(
         self,
         strategy: Strategy,
@@ -64,7 +198,40 @@ class PaperRunner:
         backfill_bars: int | None = None,
         live_take_profit_poll_seconds: float | None = None,
         debug_info_fn: Callable[[list[dict]], str] | None = None,
+        risk_reward: float | None = None,
+        sl_atr_mult: float = 2.0,
+        sl_atr_period: int = 20,
+        sl_min_fee_mult: float = 2.0,
+        bracket_poll_seconds: float = 5.0,
+        reentry_mode: str = "reversal",
+        tp_roi: float | None = None,
+        sl_roi: float | None = None,
+        state_path: str | None = None,
+        max_consecutive_sl: int | None = None,
+        max_daily_loss_pct: float | None = None,
+        day_utc_offset_hours: float = 7.0,
+        reentry_channel_fn: Callable[[list[dict]], tuple[float, float] | None] | None = None,
     ):
+        # Status yang DISIMPAN ke file (state_path) supaya bertahan lintas
+        # restart: arah yang ditahan setelah TP/SL, status "siap" masuk-lagi,
+        # hitungan SL beruntun, dan batas harian. Tanpa ini, restart/crash
+        # menghapus status itu dan bot langsung masuk lagi ke arah yang baru
+        # kena SL. File HANYA ditulis setelah dibaca (_load_persistent_state),
+        # supaya nilai awal di __init__ tidak menimpa status tersimpan.
+        self.state_path = state_path
+        self._state_loaded = False
+        self._state_saved_at_ms: int | None = None
+        # Kill switch: berhenti membuka posisi sampai hari berganti (zona
+        # UTC+day_utc_offset_hours, default WIB) setelah max_consecutive_sl SL
+        # beruntun di hari yang sama, atau rugi bersih hari itu >=
+        # max_daily_loss_pct % saldo awal hari. None/0 = mati.
+        self.max_consecutive_sl = max_consecutive_sl or None
+        self.max_daily_loss_pct = max_daily_loss_pct or None
+        self.day_utc_offset_hours = day_utc_offset_hours
+        self._consecutive_sl = 0
+        self._sl_day_ms: int | None = None
+        self._halt_until_ms: int | None = None
+        self._halt_reason: str = ""
         self.strategy = strategy
         self.broker = broker
         self.symbol = symbol
@@ -80,6 +247,44 @@ class PaperRunner:
         self.backfill_bars = backfill_bars
         self.live_take_profit_poll_seconds = live_take_profit_poll_seconds
         self.debug_info_fn = debug_info_fn
+        # SL + TP rasio di bursa -- lihat docstring modul. None = mati.
+        self.risk_reward = risk_reward
+        self.sl_atr_mult = sl_atr_mult
+        self.sl_atr_period = sl_atr_period
+        self.sl_min_fee_mult = sl_min_fee_mult
+        self.bracket_poll_seconds = bracket_poll_seconds
+        # SL/TP berdasarkan ROI KOTOR terhadap margin (fraksi: 0.05 = 5%).
+        # Alternatif dari risk_reward; keduanya tidak boleh aktif bersamaan.
+        if (tp_roi is None) != (sl_roi is None):
+            raise ValueError("tp_roi dan sl_roi harus diisi berdua")
+        if tp_roi is not None:
+            if risk_reward is not None:
+                raise ValueError("pilih salah satu: risk_reward ATAU tp_roi/sl_roi")
+            if tp_roi <= 0 or sl_roi <= 0:
+                raise ValueError("tp_roi dan sl_roi harus > 0")
+        self.tp_roi = tp_roi
+        self.sl_roi = sl_roi
+        self._bracket_enabled = risk_reward is not None or tp_roi is not None
+        # reentry_mode: kapan boleh masuk lagi ke arah YANG SAMA setelah
+        # posisi ditutup TP/SL (mode berulang):
+        #   "reversal" (default, perilaku lama): tunggu sinyal berbalik.
+        #   "midline": "siap" begitu close kembali ke tengah channel, lalu
+        #              masuk lagi saat close menembus batas channel searah
+        #              (breakout BARU) -- tidak perlu menunggu sisi seberang jebol.
+        # reentry_channel_fn(bars) -> (atas, bawah): WAJIB untuk "midline".
+        # Disuplai launcher dengan rumus channel yang SAMA dengan sinyal,
+        # supaya PaperRunner tetap tidak tahu-menahu soal Donchian.
+        if reentry_mode not in ("reversal", "midline"):
+            raise ValueError(f"reentry_mode tidak dikenal: {reentry_mode!r}")
+        if reentry_mode == "midline" and reentry_channel_fn is None:
+            raise ValueError("reentry_mode='midline' butuh reentry_channel_fn")
+        self.reentry_mode = reentry_mode
+        self.reentry_channel_fn = reentry_channel_fn
+        self._reentry_armed = False
+        # Catatan keadaan menunggu/berhenti -- dicetak di tiap heartbeat dan
+        # ditulis ke session_state.json untuk dashboard. Tanpa ini bot yang
+        # sengaja menunggu tampak MATI: log-nya cuma heartbeat.
+        self._status_note: str = ""
         # debug_info_fn: opsional -- fungsi (bars: list[dict]) -> str,
         # dipanggil tiap heartbeat DAN sekali setelah backfill, hasilnya
         # ditempel di output. PaperRunner TIDAK tahu apa isinya (tetap
@@ -112,6 +317,9 @@ class PaperRunner:
         self._entry_leverage: float = 1.0
         self._entry_taker_fee_pct: float = 0.0005  # fallback KONSERVATIF (0,05%) -- ditimpa dari bursa saat posisi dibuka
         self._tp_order_id: str | None = None  # id order TAKE_PROFIT_MARKET yang dititipkan ke bursa
+        self._sl_order_id: str | None = None  # id order STOP_MARKET (SL) yang dititipkan ke bursa
+        self._bracket: dict | None = None  # SL/TP yang sedang aktif -- lihat compute_bracket()
+        self._emergency_close_pending: bool = False  # SL gagal terpasang, posisi sedang dipaksa tutup
         self._blocked_direction: int | None = None
         self._trading_halted: bool = False
         self._last_order_info: dict | None = None  # {"client_order_id", "target_position"} -- lihat _sync_position_from_exchange
@@ -204,6 +412,14 @@ class PaperRunner:
     async def run(self) -> None:
         """Loop utama -- panggil ini untuk menjalankan runner sungguhan (butuh jaringan)."""
         print(f"=== PaperRunner mulai: {self.symbol} @ {self.timeframe} ===")
+        self._load_persistent_state()
+        if self.max_consecutive_sl or self.max_daily_loss_pct:
+            print(f"  [batas] kill switch AKTIF: berhenti membuka posisi sampai hari berganti "
+                  f"(UTC{self.day_utc_offset_hours:+g}) setelah "
+                  + " atau ".join(x for x in [
+                      f"{self.max_consecutive_sl} SL beruntun" if self.max_consecutive_sl else "",
+                      f"rugi bersih harian {self.max_daily_loss_pct:g}% saldo" if self.max_daily_loss_pct else ""] if x)
+                  + ".")
         if self.session_hours is not None:
             self._session_start = datetime.now(timezone.utc)
             end_time = self._session_start.timestamp() + self.session_hours * 3600
@@ -219,19 +435,34 @@ class PaperRunner:
                 except Exception as e:
                     print(f"  [backfill] (debug_info_fn error: {e})")
 
+        self._reconcile_restored_block()
         self.order_manager.reconcile_pending(self.symbol)  # WAJIB, lihat docstring modul
         self._recover_position_from_exchange()  # WAJIB juga -- lihat docstring: cegah order tutup tak perlu saat restart
+        if self._bracket_enabled:
+            await self._ensure_bracket_after_recovery()
+        if self.max_consecutive_sl or self.max_daily_loss_pct:
+            self._evaluate_kill_switch()
 
         async def _bar_loop() -> None:
             async for bar in self.stream.watch_bars():
                 await self.process_bar(bar)
 
+        loops = [_bar_loop()]
         if self.live_take_profit_poll_seconds is not None:
             print(f"  [price-watch] take-profit real-time AKTIF -- cek harga live tiap "
                   f"{self.live_take_profit_poll_seconds:.0f} detik, TERPISAH dari evaluasi candle.")
-            await asyncio.gather(_bar_loop(), self._price_watch_loop(self.live_take_profit_poll_seconds))
+            loops.append(self._price_watch_loop(self.live_take_profit_poll_seconds))
+        if self._bracket_enabled:
+            aturan = (f"TP ROI kotor +{self.tp_roi:.2%} / SL ROI kotor -{self.sl_roi:.2%}"
+                      if self.tp_roi is not None else f"SL + TP rasio {self.risk_reward:g}:1 (bersih setelah fee)")
+            print(f"  [bracket] {aturan} AKTIF -- "
+                  f"dieksekusi BURSA; bot mengecek posisi tiap {self.bracket_poll_seconds:g} detik "
+                  f"untuk membereskan sisa order setelah salah satunya kena.")
+            loops.append(self._bracket_watch_loop(self.bracket_poll_seconds))
+        if len(loops) > 1:
+            await asyncio.gather(*loops)
         else:
-            await _bar_loop()
+            await loops[0]
 
     async def process_bar(self, bar: dict) -> None:
         """
@@ -268,8 +499,10 @@ class PaperRunner:
             except Exception as e:
                 debug_suffix = f"  (debug_info_fn error: {e})"
 
+        self._status_note = self._compute_status_note(latest_signal)
+        status_suffix = f"  [status] {self._status_note}" if self._status_note else ""
         print(f"  [heartbeat] {bar_time:%Y-%m-%d %H:%M} UTC  close={bar['close']:.2f}  "
-              f"posisi={self._current_position}  sinyal={latest_signal}{debug_suffix}")
+              f"posisi={self._current_position}  sinyal={latest_signal}{debug_suffix}{status_suffix}")
 
         if self._trading_halted:
             # stop_after_take_profit aktif dan sudah pernah kena -- tidak
@@ -280,7 +513,11 @@ class PaperRunner:
 
         current_price = float(bar["close"])
         async with self._action_lock:
-            if self._check_take_profit(bar):
+            if self._emergency_close_pending:
+                await self._retry_emergency_close(df)
+            elif await self._check_bracket_exit():
+                pass  # SL/TP bursa baru saja menutup posisi -- sinyal dievaluasi lagi bar berikutnya
+            elif self._check_take_profit(bar):
                 direction = 1 if self._current_position == Position.LONG else -1
                 extreme_price = bar["high"] if direction == 1 else bar["low"]
                 raw_pct = (extreme_price - self._entry_price) / self._entry_price * direction
@@ -309,16 +546,24 @@ class PaperRunner:
                               "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
                     else:
                         self._blocked_direction = triggered_direction
+                        self._reentry_armed = False
                 else:
                     print(f"  [take-profit] Order penutup TERKIRIM tapi BELUM terkonfirmasi flat "
                           f"(posisi masih {self._current_position}) -- AKAN DICOBA LAGI bar berikutnya, "
                           f"BELUM berhenti trading.")
+            elif (self._current_position == Position.FLAT and latest_signal != Position.FLAT
+                  and self._limit_halt_active()):
+                pass  # batas harian tercapai -- tidak membuka posisi baru (lihat catatan status)
             elif latest_signal != self._current_position:
                 if self._blocked_direction is not None and latest_signal == self._blocked_direction:
-                    print(f"  [take-profit] sinyal masih arah {latest_signal}, arah yang BARU SAJA "
-                          f"di-take-profit -- DITAHAN, tunggu sinyal benar-benar berbalik dulu.")
+                    if self.reentry_mode == "midline":
+                        await self._maybe_reenter(df, latest_signal)
+                    else:
+                        print(f"  [take-profit] sinyal masih arah {latest_signal}, arah yang BARU SAJA "
+                              f"di-take-profit -- DITAHAN, tunggu sinyal benar-benar berbalik dulu.")
                 else:
                     self._blocked_direction = None  # sinyal sudah beda arah -- blokir dicabut
+                    self._reentry_armed = False
                     await self._handle_signal_change(latest_signal, df)
 
         self._check_session_warning(bar_time)
@@ -348,6 +593,7 @@ class PaperRunner:
             "latest_signal": signal,
             "latest_price": price,
             "latest_bar_time": bar_time.isoformat(),
+            "status_note": self._status_note,
         }
         try:
             Path("data").mkdir(exist_ok=True)
@@ -512,6 +758,7 @@ class PaperRunner:
                           "stop_after_take_profit AKTIF, BERHENTI trading total.")
                 else:
                     self._blocked_direction = triggered_direction
+                    self._reentry_armed = False
             else:
                 print("  [price-watch][take-profit] Order penutup TERKIRIM tapi BELUM terkonfirmasi "
                       "flat -- dicoba lagi poll berikutnya.")
@@ -527,6 +774,559 @@ class PaperRunner:
         while not self._trading_halted:
             await self._price_watch_tick()
             await asyncio.sleep(poll_interval_seconds)
+
+    # ------------------------------------------------------------------
+    # SL + TP rasio di bursa
+    # ------------------------------------------------------------------
+
+    def _cancel_conditional_orders_safely(self, alasan: str) -> int:
+        """Batalkan semua order bersyarat simbol ini. Gagal = dicetak, tidak menghentikan bot."""
+        try:
+            n = self.broker.cancel_conditional_orders(self.symbol)
+            if n:
+                print(f"  [bracket] {n} order bersyarat (SL/TP) dibatalkan -- {alasan}.")
+            return n
+        except Exception as e:
+            print(f"  [bracket] GAGAL membatalkan order bersyarat ({alasan}): {e}")
+            return -1
+
+    def _reset_position_state(self) -> None:
+        self._current_position = Position.FLAT
+        self._entry_price = None
+        self._entry_leverage = 1.0
+        self._entry_taker_fee_pct = 0.0005
+        self._tp_order_id = None
+        self._sl_order_id = None
+        self._bracket = None
+
+    async def _place_bracket(self, direction: int, ref_price: float) -> None:
+        """
+        Pasang SL lalu TP di bursa untuk posisi yang BARU dibuka. SL dipasang
+        lebih dulu karena itu pelindung utama. Kalau SL gagal dipasang atau
+        tidak lolos verifikasi, posisi DITUTUP -- tidak pernah dibiarkan
+        terbuka tanpa SL.
+        """
+        if self.tp_roi is not None:
+            b = compute_bracket_roi(self._entry_price, direction, self._entry_leverage,
+                                    self.tp_roi, self.sl_roi, self._entry_taker_fee_pct)
+        else:
+            atr = compute_atr(self._bars, self.sl_atr_period)
+            b = compute_bracket(self._entry_price, direction, atr, self._entry_taker_fee_pct,
+                                self.risk_reward, self.sl_atr_mult, self.sl_min_fee_mult)
+        pos_side = "long" if direction == Position.LONG else "short"
+
+        # Harga SUDAH melewati target? (terjadi saat posisi lama dipasangi
+        # SL/TP baru setelah restart, atau SL yang sangat dekat.) Bursa akan
+        # menolak order bersyarat yang langsung terpicu, jadi tutup sekarang.
+        try:
+            kini = self.broker.fetch_current_price(self.symbol)
+        except Exception:
+            kini = None
+        if kini is not None:
+            long = direction == Position.LONG
+            lewat_tp = (kini >= b["tp_price"]) if long else (kini <= b["tp_price"])
+            lewat_sl = (kini <= b["sl_price"]) if long else (kini >= b["sl_price"])
+            if lewat_tp or lewat_sl:
+                await self._close_target_already_reached("TP" if lewat_tp else "SL", kini, b, direction)
+                return
+
+        self._cancel_conditional_orders_safely("bersihkan sisa sebelum pasang SL/TP baru")
+
+        try:
+            sl_id = self.broker.place_stop_market(self.symbol, pos_side, b["sl_price"])
+        except Exception as e:
+            await self._emergency_close(ref_price, f"SL gagal dipasang di bursa ({e})")
+            return
+        self._sl_order_id = sl_id
+        self._bracket = b
+
+        try:
+            self._tp_order_id = self.broker.place_take_profit_market(self.symbol, pos_side, b["tp_price"])
+        except Exception as e:
+            self._tp_order_id = None
+            print(f"  [take-profit] GAGAL titip TP ke bursa ({e}) -- posisi TETAP dilindungi SL, "
+                  f"keluar lewat SL atau reversal sinyal.")
+
+        ok, detail = self._verify_stop_loss(b["sl_price"], sl_id)
+        if not ok:
+            self._cancel_conditional_orders_safely("SL tidak lolos verifikasi")
+            await self._emergency_close(ref_price, detail)
+            return
+
+        notional = self.order_amount * self._entry_price
+        rugi = notional * (b["sl_dist"] + b["fee_rt"])
+        untung = notional * (b["tp_dist"] - b["fee_rt"])
+        rasio = f"{b['rr']:.3g}" if b.get("rr") is not None else "?"
+        if b.get("tp_roi") is not None:
+            print(f"  [bracket] SL/TP dititipkan ke BURSA -- {pos_side.upper()} entry {self._entry_price:.2f}, "
+                  f"leverage {b['leverage']:g}x, fee {self._entry_taker_fee_pct:.3%}/sisi:")
+            print(f"     SL {b['sl_price']:.2f} (harga {b['sl_dist']:.3%} = ROI kotor -{b['sl_roi']:.2%}) "
+                  f"-> rugi total ~{rugi:.2f} USDT termasuk fee")
+            print(f"     TP {b['tp_price']:.2f} (harga {b['tp_dist']:.3%} = ROI kotor +{b['tp_roi']:.2%}) "
+                  f"-> untung bersih ~{untung:.2f} USDT (rasio bersih {rasio}:1)")
+            if untung <= 0:
+                print("     PERINGATAN: TP ini TIDAK menutup fee -- kalau TP kena, hasilnya tetap RUGI.")
+        else:
+            atr_txt = f"{b['atr']:.2f}" if b["atr"] is not None else "belum tersedia"
+            print(f"  [bracket] SL/TP dititipkan ke BURSA -- {pos_side.upper()} entry {self._entry_price:.2f}, "
+                  f"ATR{self.sl_atr_period} {atr_txt}, fee {self._entry_taker_fee_pct:.3%}/sisi:")
+            print(f"     SL {b['sl_price']:.2f} (jarak {b['sl_dist']:.3%}, dasar: {b['sl_basis']}) "
+                  f"-> rugi bersih ~{rugi:.2f} USDT")
+            print(f"     TP {b['tp_price']:.2f} (jarak {b['tp_dist']:.3%}) -> untung bersih ~{untung:.2f} USDT "
+                  f"(rasio bersih {rasio}:1)")
+        print(f"     {detail}")
+
+    async def _close_target_already_reached(self, kind: str, kini: float, b: dict, direction: int) -> None:
+        """Harga sudah di/lewat TP atau SL saat akan dipasang -> tutup sekarang, terapkan aturan TP/SL."""
+        if kind == "TP":
+            print(f"  [take-profit] harga {kini:.2f} SUDAH mencapai target TP {b['tp_price']:.2f} -- TUTUP PAKSA sekarang.")
+        else:
+            print(f"  [stop-loss] harga {kini:.2f} SUDAH melewati SL {b['sl_price']:.2f} -- posisi ditutup sekarang.")
+        self._bracket = None
+        self._cancel_conditional_orders_safely("harga sudah melewati target")
+        await self._handle_signal_change(Position.FLAT, override_price=kini)
+        if self._current_position != Position.FLAT:
+            # Jangan biarkan posisi terbuka tanpa SL: jalur darurat mencoba
+            # menutup tiap bar, lalu menghentikan bot setelah flat.
+            print("  [stop-loss] order penutup belum terisi -- dialihkan ke penutupan DARURAT.")
+            self._emergency_close_pending = True
+            return
+        if kind == "TP":
+            if self.stop_after_take_profit:
+                self._trading_halted = True
+                print("  [take-profit] Penutupan terkonfirmasi FLAT -- stop_after_take_profit "
+                      "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
+            else:
+                self._blocked_direction = direction
+                self._reentry_armed = False
+        else:
+            print("  [stop-loss] posisi TERTUTUP di sekitar harga SL.")
+            self._blocked_direction = direction
+            self._reentry_armed = False
+        self._register_exit(kind)
+
+    def _verify_stop_loss(self, expected: float, sl_id: str) -> tuple[bool, str]:
+        """
+        Pastikan SL BENAR-BENAR ada di bursa dengan harga pemicu yang benar.
+        Menangkap jebakan migrasi Binance: order bersyarat yang dikirim dengan
+        nama parameter lama DITERIMA tapi tanpa harga pemicu, sehingga tidak
+        pernah terpicu.
+        """
+        try:
+            orders = self.broker.fetch_open_conditional_orders(self.symbol)
+        except Exception as e:
+            return True, (f"verifikasi SL dilewati (gagal membaca order bursa: {e}) -- "
+                          f"SL diterima bursa saat dikirim")
+        cocok = [o for o in orders if str(o["id"]) == str(sl_id)]
+        if not cocok:
+            return False, f"SL id={sl_id} TIDAK ditemukan di daftar order bersyarat bursa"
+        trig = cocok[0]["trigger_price"]
+        if trig is None:
+            return False, ("SL tercatat di bursa TANPA harga pemicu -- order seperti ini tidak akan "
+                           "pernah terpicu (kemungkinan versi ccxt tidak cocok dengan endpoint Algo)")
+        if abs(trig - expected) / expected > 0.0005:
+            return False, f"harga pemicu SL di bursa {trig:.2f} beda dari yang diminta {expected:.2f}"
+        return True, f"SL terverifikasi di bursa (pemicu {trig:.2f})"
+
+    async def _emergency_close(self, ref_price: float, alasan: str) -> None:
+        """Tutup posisi SEKARANG karena tidak terlindungi SL, lalu berhenti membuka posisi baru."""
+        print("\n" + "!" * 70)
+        print(f"  [stop-loss] DARURAT: {alasan}.")
+        print("  Posisi TIDAK boleh dibiarkan terbuka tanpa SL -- ditutup SEKARANG. Bot berhenti")
+        print("  membuka posisi baru sampai Anda memeriksa penyebabnya dan me-restart manual.")
+        print("!" * 70 + "\n")
+        self._bracket = None  # SL yang gagal tidak dipasang ulang
+        self._emergency_close_pending = True
+        await self._handle_signal_change(Position.FLAT, override_price=ref_price)
+        self._finish_emergency_if_flat()
+
+    async def _retry_emergency_close(self, df: pd.DataFrame) -> None:
+        print("  [stop-loss] DARURAT: posisi belum tertutup -- mencoba menutup lagi.")
+        await self._handle_signal_change(Position.FLAT, df)
+        self._finish_emergency_if_flat()
+
+    def _finish_emergency_if_flat(self) -> None:
+        if self._current_position == Position.FLAT:
+            self._emergency_close_pending = False
+            self._trading_halted = True
+            print("  [stop-loss] DARURAT selesai: posisi FLAT, bot BERHENTI membuka posisi. "
+                  "Periksa log di atas, lalu restart manual.")
+
+    def _restore_stop_loss(self) -> None:
+        pos_side = "long" if self._current_position == Position.LONG else "short"
+        try:
+            self._sl_order_id = self.broker.place_stop_market(self.symbol, pos_side, self._bracket["sl_price"])
+            self._tp_order_id = None
+            print(f"  [stop-loss] order penutup belum terisi -- SL {self._bracket['sl_price']:.2f} DIPASANG "
+                  f"ULANG supaya posisi tidak terbuka tanpa pelindung.")
+        except Exception as e:
+            print(f"  [stop-loss] GAGAL memasang ulang SL ({e}) -- posisi SEMENTARA TANPA SL, "
+                  f"penutupan dicoba lagi bar berikutnya.")
+
+    async def _check_bracket_exit(self) -> bool:
+        """
+        Kalau SL/TP sedang aktif tapi posisi di bursa sudah FLAT, berarti
+        salah satunya kena (atau ditutup di luar bot). Bereskan sisa order,
+        catat SL atau TP, terapkan aturan setelahnya. True kalau ini terjadi.
+        Dipanggil di bawah _action_lock.
+        """
+        if self._bracket is None or self._current_position == Position.FLAT:
+            return False
+        try:
+            actual = self.broker.fetch_position(self.symbol, quiet=True)
+        except Exception as e:
+            print(f"  [bracket] gagal cek posisi ({e}) -- dicoba lagi berikutnya")
+            return False
+        if actual is not None:
+            return False
+
+        b = self._bracket
+        direction = self._current_position
+        try:
+            exit_price = self.broker.fetch_last_fill_price(self.symbol)
+        except Exception:
+            exit_price = None
+        kind = classify_bracket_exit(exit_price, b)
+        self._cancel_conditional_orders_safely("pasangan SL/TP yang tidak kena")
+        self._reset_position_state()
+        keluar = f"{exit_price:.2f}" if exit_price is not None else "?"
+
+        if kind == "TP":
+            print(f"  [take-profit] TP di BURSA KENA (pemicu {b['tp_price']:.2f}, keluar ~{keluar}) "
+                  f"-- posisi TERTUTUP.")
+            if self.stop_after_take_profit:
+                self._trading_halted = True
+                print("  [take-profit] Penutupan terkonfirmasi FLAT -- stop_after_take_profit "
+                      "AKTIF, program BERHENTI trading total (restart manual untuk lanjut).")
+            else:
+                self._blocked_direction = direction
+                self._reentry_armed = False
+        else:
+            if kind == "SL":
+                print(f"  [stop-loss] SL di BURSA KENA (pemicu {b['sl_price']:.2f}, keluar ~{keluar}) "
+                      f"-- posisi TERTUTUP.")
+            else:
+                print("  [stop-loss] posisi TERTUTUP tapi harga keluar tidak terbaca -- "
+                      "diperlakukan sebagai STOP LOSS demi keamanan.")
+            self._blocked_direction = direction
+            self._reentry_armed = False
+            print(f"  [stop-loss] arah {direction} DITAHAN sampai sinyal benar-benar berbalik "
+                  f"(tidak langsung masuk lagi ke arah yang baru rugi).")
+        self._register_exit(kind)
+        return True
+
+    # ------------------------------------------------------------------
+    # Status tersimpan & kill switch
+    # ------------------------------------------------------------------
+
+    def _clock_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _day_start_ms(self, ms: int) -> int:
+        off = int(self.day_utc_offset_hours * 3_600_000)
+        return ((ms + off) // 86_400_000) * 86_400_000 - off
+
+    def _fmt_local(self, ms: int) -> str:
+        tz = timezone(timedelta(hours=self.day_utc_offset_hours))
+        return f"{datetime.fromtimestamp(ms / 1000, tz=tz):%Y-%m-%d %H:%M} (UTC{self.day_utc_offset_hours:+g})"
+
+    def _persist_state(self) -> None:
+        if not self.state_path or not getattr(self, "_state_loaded", False):
+            return
+        try:
+            path = Path(self.state_path)
+            semua = {}
+            if path.exists():
+                try:
+                    semua = json.loads(path.read_text() or "{}")
+                except Exception:
+                    semua = {}
+            semua[self.symbol] = {
+                "blocked_direction": self._blocked_direction,
+                "reentry_armed": bool(self._reentry_armed),
+                "consecutive_sl": self._consecutive_sl,
+                "sl_day_ms": self._sl_day_ms,
+                "halt_until_ms": self._halt_until_ms,
+                "halt_reason": self._halt_reason,
+                "saved_at_ms": self._clock_ms(),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(semua, indent=2))
+            os.replace(tmp, path)  # atomik: file tidak pernah setengah tertulis
+        except Exception as e:
+            print(f"  (Peringatan: gagal menyimpan status bot ke {self.state_path}: {e})")
+
+    def _load_persistent_state(self) -> None:
+        """Pulihkan status dari sesi sebelumnya. Setelah ini, perubahan status disimpan."""
+        self._state_loaded = True
+        if not self.state_path:
+            return
+        path = Path(self.state_path)
+        if not path.exists():
+            print(f"  [state] belum ada status tersimpan ({self.state_path}) -- mulai bersih.")
+            return
+        try:
+            data = (json.loads(path.read_text() or "{}") or {}).get(self.symbol)
+        except Exception as e:
+            print(f"  [state] status tersimpan tidak bisa dibaca ({e}) -- mulai bersih.")
+            return
+        if not data:
+            return
+        self._state_saved_at_ms = data.get("saved_at_ms")
+        self._blocked_direction_v = data.get("blocked_direction")   # langsung: jangan tulis ulang saat memuat
+        self._reentry_armed_v = bool(data.get("reentry_armed"))
+        self._consecutive_sl = int(data.get("consecutive_sl") or 0)
+        self._sl_day_ms = data.get("sl_day_ms")
+        if self._sl_day_ms is not None and self._sl_day_ms != self._day_start_ms(self._clock_ms()):
+            self._consecutive_sl = 0          # hitungan SL beruntun berlaku per hari
+        h = data.get("halt_until_ms")
+        if h and h > self._clock_ms():
+            self._halt_until_ms, self._halt_reason = h, data.get("halt_reason") or ""
+        bagian = []
+        if self._blocked_direction_v is not None:
+            bagian.append(f"arah {self._blocked_direction_v} DITAHAN"
+                          f"{' (sudah siap masuk lagi)' if self._reentry_armed_v else ''}")
+        if self._consecutive_sl:
+            bagian.append(f"{self._consecutive_sl} SL beruntun hari ini")
+        if self._halt_until_ms:
+            bagian.append(f"batas harian aktif sampai {self._fmt_local(self._halt_until_ms)}")
+        if bagian:
+            print(f"  [state] status sesi sebelumnya dipulihkan: {'; '.join(bagian)}.")
+
+    def _reconcile_restored_block(self) -> None:
+        """
+        Arah yang ditahan dari sesi lalu dicabut kalau sinyal SEMPAT berbalik
+        selama bot mati (dicek dari candle backfill sesudah status terakhir
+        disimpan). Kalau backfill tidak menjangkau waktu itu, blokir
+        dipertahankan -- pilihan yang aman.
+        """
+        d = self._blocked_direction
+        if d is None or not self._state_saved_at_ms or len(self._bars) < 2:
+            return
+        if self._bars[0]["timestamp"] > self._state_saved_at_ms:
+            print("  [state] histori backfill tidak menjangkau saat bot terakhir jalan -- "
+                  f"arah {d} tetap DITAHAN (aman).")
+            return
+        try:
+            sinyal = list(self.strategy.generate_signals(self._bars_to_df()).astype(int))
+        except Exception as e:
+            print(f"  [state] gagal mengecek sinyal selama bot mati ({e}) -- arah {d} tetap DITAHAN.")
+            return
+        sesudah = [v for b, v in zip(self._bars, sinyal) if b["timestamp"] > self._state_saved_at_ms]
+        if any(v == -d for v in sesudah):
+            print(f"  [state] sinyal sempat berbalik selama bot mati -- arah {d} tidak lagi ditahan.")
+            self._blocked_direction = None
+            self._reentry_armed = False
+        else:
+            print(f"  [state] arah {d} tetap DITAHAN dari sesi sebelumnya sampai sinyal berbalik.")
+
+    def _register_exit(self, kind: str) -> None:
+        """Catat hasil keluar lewat TP/SL untuk kill switch, lalu evaluasi."""
+        if kind == "TP":
+            self._consecutive_sl = 0
+        else:  # "SL" atau "UNKNOWN" (diperlakukan sebagai SL)
+            hari = self._day_start_ms(self._clock_ms())
+            if self._sl_day_ms != hari:
+                self._consecutive_sl, self._sl_day_ms = 0, hari
+            self._consecutive_sl += 1
+        self._persist_state()
+        if self.max_consecutive_sl or self.max_daily_loss_pct:
+            self._evaluate_kill_switch()
+
+    def _evaluate_kill_switch(self) -> None:
+        if self._halt_until_ms is not None:
+            return
+        now = self._clock_ms()
+        hari = self._day_start_ms(now)
+        alasan = None
+        if (self.max_consecutive_sl and self._sl_day_ms == hari
+                and self._consecutive_sl >= self.max_consecutive_sl):
+            alasan = f"{self._consecutive_sl} SL beruntun hari ini (batas {self.max_consecutive_sl})"
+        if alasan is None and self.max_daily_loss_pct:
+            try:
+                r = self.broker.fetch_realized_pnl_since(self.symbol, hari)
+                bersih = float(r["realized"]) - float(r["fee"])
+                saldo = float(((self.broker.fetch_balance() or {}).get("USDT") or {}).get("total") or 0)
+                awal = saldo - bersih
+                if bersih < 0 and awal > 0 and -bersih / awal * 100 >= self.max_daily_loss_pct:
+                    alasan = (f"rugi bersih hari ini {bersih:.2f} USDT = {-bersih / awal * 100:.2f}% "
+                              f"saldo awal hari (batas {self.max_daily_loss_pct:g}%)")
+            except Exception as e:
+                print(f"  [batas] gagal menghitung rugi harian ({e}) -- dicek lagi di penutupan berikutnya.")
+        if alasan:
+            self._halt_until_ms, self._halt_reason = hari + 86_400_000, alasan
+            print("\n" + "!" * 70)
+            print(f"  [batas] BATAS HARIAN TERCAPAI: {alasan}.")
+            print(f"  Entry baru ditahan sampai {self._fmt_local(self._halt_until_ms)}. "
+                  f"Posisi yang sudah tertutup tidak dibuka lagi sampai hari berganti.")
+            print("!" * 70 + "\n")
+            self._persist_state()
+
+    def _limit_halt_active(self) -> bool:
+        if self._halt_until_ms is None:
+            return False
+        if self._clock_ms() >= self._halt_until_ms:
+            print("  [batas] hari berganti -- batas harian dicabut, bot boleh membuka posisi lagi.")
+            self._halt_until_ms, self._halt_reason, self._consecutive_sl = None, "", 0
+            self._persist_state()
+            return False
+        return True
+
+    def _compute_status_note(self, latest_signal: int) -> str:
+        """
+        Kalimat singkat: kenapa bot TIDAK membuka posisi padahal sinyal ada.
+        Kosong = tidak ada yang perlu dijelaskan.
+
+        HATI-HATI dengan teksnya: dashboard mematikan bot kalau ada SATU baris
+        log yang memuat dua penanda take-profit-selesai sekaligus, dan
+        notifier membaca "[take-profit]"/"[stop-loss]" untuk alasan
+        penutupan. Teks di sini sengaja menghindari semua penanda itu
+        (diuji di smoke_reentry).
+        """
+        if self._emergency_close_pending:
+            return "DARURAT: SL gagal terpasang, bot sedang menutup posisi"
+        if self._trading_halted:
+            return "DIHENTIKAN: tidak membuka posisi baru (jalankan ulang bot untuk lanjut)"
+        if self._halt_until_ms is not None and self._clock_ms() < self._halt_until_ms:
+            return (f"BATAS HARIAN: {self._halt_reason}. Entry baru ditahan sampai "
+                    f"{self._fmt_local(self._halt_until_ms)}")
+        if (self.reentry_mode == "midline" and self._blocked_direction is not None
+                and latest_signal == self._blocked_direction and self._current_position != latest_signal):
+            long = latest_signal == Position.LONG
+            arah = "LONG" if long else "SHORT"
+            try:
+                ch = self.reentry_channel_fn(self._bars)
+            except Exception:
+                ch = None
+            if not ch:
+                return f"DITAHAN {arah}: menunggu data channel"
+            atas, bawah = ch
+            tengah = (atas + bawah) / 2
+            batas = atas if long else bawah
+            if self._reentry_armed:
+                return (f"DITAHAN {arah} (sudah siap): masuk begitu close "
+                        f"{'di atas' if long else 'di bawah'} {batas:.2f}")
+            return (f"DITAHAN {arah}: belum siap. Tunggu close "
+                    f"{'turun ke' if long else 'naik ke'} {tengah:.2f} (tengah channel) "
+                    f"{'atau lebih rendah' if long else 'atau lebih tinggi'}, "
+                    f"baru masuk saat close {'di atas' if long else 'di bawah'} {batas:.2f}")
+        return ""
+
+    async def _maybe_reenter(self, df: pd.DataFrame, direction: int) -> None:
+        """
+        Mode "midline": arah `direction` sedang diblokir setelah TP/SL.
+          1. Tunggu close KEMBALI ke tengah channel -> status "siap".
+          2. Setelah siap, close menembus batas channel searah (breakout
+             baru) -> blokir dicabut, masuk lagi ke arah itu.
+        Channel dihitung dari `lookback` bar SEBELUM bar ini (rumus yang
+        sama dengan sinyal), jadi "menembus" di sini sama artinya dengan
+        breakout yang memicu sinyal.
+        """
+        try:
+            ch = self.reentry_channel_fn(self._bars)
+        except Exception as e:
+            print(f"  [re-entry] gagal menghitung channel ({e}) -- dicoba lagi bar berikutnya")
+            return
+        if not ch:
+            return
+        atas, bawah = ch
+        tengah = (atas + bawah) / 2
+        close = float(df["close"].iloc[-1])
+        long = direction == Position.LONG
+        arah = "LONG" if long else "SHORT"
+
+        if not self._reentry_armed:
+            if (close <= tengah) if long else (close >= tengah):
+                self._reentry_armed = True
+                batas = atas if long else bawah
+                print(f"  [re-entry] harga {close:.2f} kembali ke tengah channel ({tengah:.2f}) -- SIAP masuk "
+                      f"{arah} lagi begitu close menembus {'atas' if long else 'bawah'} {batas:.2f}.")
+            return
+
+        if (close > atas) if long else (close < bawah):
+            batas = atas if long else bawah
+            print(f"  [re-entry] BREAKOUT BARU searah: close {close:.2f} menembus "
+                  f"{'atas' if long else 'bawah'} {batas:.2f} -- masuk {arah} lagi.")
+            self._blocked_direction = None
+            self._reentry_armed = False
+            await self._handle_signal_change(direction, df)
+
+    async def _bracket_watch_loop(self, poll_interval_seconds: float) -> None:
+        """
+        Cek ringan tiap beberapa detik: apakah SL/TP sudah menutup posisi.
+        Eksekusinya tetap oleh BURSA; loop ini cuma membereskan sisa order
+        dan mencatat hasilnya cepat (tidak menunggu candle tutup), supaya
+        notifier Gmail sempat membaca alasannya dari log.
+        """
+        loop = asyncio.get_event_loop()
+        while not self._trading_halted:
+            await asyncio.sleep(poll_interval_seconds)
+            if self._bracket is None or self._current_position == Position.FLAT:
+                continue
+            try:
+                actual = await loop.run_in_executor(
+                    None, lambda: self.broker.fetch_position(self.symbol, quiet=True))
+            except Exception as e:
+                print(f"  [bracket] gagal cek posisi ({e}) -- dicoba lagi berikutnya")
+                continue
+            if actual is not None:
+                continue
+            async with self._action_lock:
+                await self._check_bracket_exit()
+
+    async def _ensure_bracket_after_recovery(self) -> None:
+        """
+        Setelah restart dengan posisi terbuka: pakai SL/TP yang sudah ada di
+        bursa (dari sesi sebelumnya) kalau ada; kalau tidak ada SL, pasang
+        sekarang. Posisi tidak boleh terbuka tanpa SL.
+        """
+        if self._current_position == Position.FLAT:
+            return
+        try:
+            orders = self.broker.fetch_open_conditional_orders(self.symbol)
+        except Exception as e:
+            print(f"  [startup] gagal membaca SL/TP di bursa ({e}) -- SL/TP dipasang ulang.")
+            orders = []
+        sls = [o for o in orders if o["type"].startswith("STOP") and o["trigger_price"]]
+        tps = [o for o in orders if o["type"].startswith("TAKE_PROFIT")]
+        if self.tp_roi is not None and self._entry_price:
+            # Mode ROI hasilnya PASTI dari harga masuk + leverage, jadi SL/TP
+            # yang tidak cocok dengan pengaturan sekarang (mis. sisa mode
+            # rasio/ATR) diganti. Mode ATR tidak begini: SL-nya sengaja tetap.
+            b = compute_bracket_roi(self._entry_price, self._current_position, self._entry_leverage,
+                                    self.tp_roi, self.sl_roi, self._entry_taker_fee_pct)
+            cocok = lambda o, harga: o["trigger_price"] and abs(o["trigger_price"] - harga) / harga <= 0.0005
+            if not (sls and tps and cocok(sls[0], b["sl_price"]) and cocok(tps[0], b["tp_price"])):
+                lama = (f"SL {sls[0]['trigger_price']:.2f}" if sls else "tanpa SL") + \
+                       (f" / TP {tps[0]['trigger_price']:.2f}" if tps and tps[0]["trigger_price"] else " / tanpa TP")
+                print(f"  [startup] SL/TP di bursa ({lama}) TIDAK sesuai pengaturan sekarang (TP ROI "
+                      f"+{self.tp_roi:.2%}, SL ROI -{self.sl_roi:.2%}) -- DIGANTI dari harga masuk "
+                      f"{self._entry_price:.2f}.")
+                await self._place_bracket(self._current_position, self._entry_price)
+                return
+        if sls:
+            self._sl_order_id = sls[0]["id"]
+            self._tp_order_id = tps[0]["id"] if tps else None
+            self._bracket = {"sl_price": sls[0]["trigger_price"],
+                             "tp_price": tps[0]["trigger_price"] if tps else None, "adopted": True}
+            tp_txt = f"{tps[0]['trigger_price']:.2f}" if tps and tps[0]["trigger_price"] else "tidak ada"
+            print(f"  [startup] SL {sls[0]['trigger_price']:.2f} dan TP {tp_txt} di bursa DIPAKAI dari "
+                  f"sesi sebelumnya -- tidak dipasang ulang.")
+            return
+        ref = self._entry_price
+        if ref is None:
+            try:
+                ref = self.broker.fetch_current_price(self.symbol)
+            except Exception:
+                ref = None
+        if ref is None:
+            print("  [startup] posisi terbuka TANPA SL dan harga acuan tidak terbaca -- ditutup demi keamanan.")
+            self._emergency_close_pending = True
+            return
+        self._entry_price = ref
+        print(f"  [startup] posisi TERBUKA TANPA SL di bursa -- SL/TP dipasang sekarang dari harga {ref:.2f}.")
+        await self._place_bracket(self._current_position, ref)
 
     def _recover_position_from_exchange(self) -> None:
         """
@@ -736,6 +1536,15 @@ class PaperRunner:
         except Exception as e:
             print(f"  [signal] gagal cek/batalkan order lama: {e} -- tetap coba kirim order baru")
 
+        # Order BERSYARAT (SL/TP di endpoint Algo) TIDAK terbaca oleh
+        # cancel_open_orders() di atas -- endpoint-nya berbeda sejak migrasi
+        # Binance 2025-12-09. Tanpa ini, TP/SL posisi lama tertinggal di
+        # bursa setelah posisi ditutup lewat reversal sinyal. Hanya dipanggil
+        # kalau memang ada yang mungkin tertinggal, jadi mode lama tanpa
+        # TP bursa tidak terpengaruh.
+        if self._bracket is not None or self._tp_order_id is not None or self._bracket_enabled:
+            self._cancel_conditional_orders_safely("sebelum kirim order baru")
+
         order_price = self._aggressive_price(side, signal_price)
 
         order_amount = self.order_amount
@@ -781,13 +1590,22 @@ class PaperRunner:
             signal = SignalContext(signal_time=signal_time, signal_price=signal_price)
             self.slippage_tracker.record_fill(signal, result)
 
+        if is_closing and status != "filled" and self._bracket is not None:
+            # SL sudah dibatalkan di atas, tapi posisi BELUM tertutup --
+            # jangan biarkan terbuka tanpa pelindung sampai bar berikutnya.
+            self._restore_stop_loss()
+
         if status == "filled":
             self._current_position = target_after_this_order
             if target_after_this_order == Position.FLAT:
                 self._entry_price = None  # posisi ditutup -- tidak ada entry aktif lagi
                 self._entry_leverage = 1.0
                 self._entry_taker_fee_pct = 0.0005  # kembali ke fallback konservatif
+                if self.max_daily_loss_pct:
+                    self._evaluate_kill_switch()
                 self._tp_order_id = None  # posisi tutup -- id TP lama tidak relevan lagi
+                self._sl_order_id = None
+                self._bracket = None
             else:
                 # posisi BARU dibuka -- catat harga eksekusi SUNGGUHAN
                 # (average_price), bukan harga limit yang diminta,
@@ -834,7 +1652,9 @@ class PaperRunner:
                 # yang membuat net_roi PERSIS sama dengan take_profit_pct.
                 #   net = raw*L - 2*f*L >= TP   ->   raw >= TP/L + 2*f
                 # Perhatikan suku fee TIDAK ikut terbagi leverage.
-                if self.take_profit_pct is not None:
+                if self._bracket_enabled:
+                    await self._place_bracket(target_after_this_order, signal_price)
+                elif self.take_profit_pct is not None:
                     direction = 1 if target_after_this_order == Position.LONG else -1
                     move = self.take_profit_pct / self._entry_leverage + 2 * self._entry_taker_fee_pct
                     tp_price = self._entry_price * (1 + direction * move)
