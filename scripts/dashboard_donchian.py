@@ -243,7 +243,7 @@ def _angka(v) -> float | None:
 
 
 def hitung_pnl_berjalan(raw_positions: list[dict], position: dict | None,
-                        last_price: float | None, fee_pct: float) -> dict | None:
+                        last_price: float | None, fee_pct: float | None) -> dict | None:
     """
     Untung/rugi posisi yang MASIH TERBUKA (belum direalisasi). FUNGSI MURNI.
 
@@ -299,8 +299,11 @@ def hitung_pnl_berjalan(raw_positions: list[dict], position: dict | None,
         sumber = "dihitung"
 
     margin_awal = entry * qty / lev if lev else None
-    fee_buka = entry * qty * fee_pct
-    fee_tutup = (harga_acuan if harga_acuan is not None else entry) * qty * fee_pct
+    fee_total = None
+    if fee_pct is not None:
+        fee_buka = entry * qty * fee_pct
+        fee_tutup = (harga_acuan if harga_acuan is not None else entry) * qty * fee_pct
+        fee_total = fee_buka + fee_tutup
     return {
         "side": side, "qty": qty, "entry": entry, "leverage": lev,
         "harga_acuan": harga_acuan, "acuan": acuan,
@@ -308,8 +311,8 @@ def hitung_pnl_berjalan(raw_positions: list[dict], position: dict | None,
         "pnl": pnl, "sumber": sumber,
         "margin_awal": margin_awal,
         "roi_pct": (pnl / margin_awal) if margin_awal else None,
-        "fee_pct": fee_pct, "fee_total": fee_buka + fee_tutup,
-        "bersih_setelah_fee": pnl - fee_buka - fee_tutup,
+        "fee_pct": fee_pct, "fee_total": fee_total,
+        "bersih_setelah_fee": pnl - fee_total if fee_total is not None else None,
     }
 
 
@@ -550,9 +553,7 @@ class DashboardState:
         self.snapshot: dict = {"status": "memuat", "last_error": None, "last_update": None}
         self.trades: list[dict] = []
         self._broker = None
-        # Fee taker per simbol, diambil SEKALI dari akun lalu disimpan --
-        # tidak perlu ditanyakan ke bursa tiap refresh.
-        self._fee_cache: dict[str, float] = {}
+        # Fee tidak di-cache: setiap refresh meminta tarif akun kembali.
         # Leverage posisi terakhir yang pernah terlihat -- dipakai pratinjau
         # SL/TP di form saat sedang tidak ada posisi.
         self._last_leverage: float | None = None
@@ -574,19 +575,16 @@ class DashboardState:
             self.account = resolve_account()
         return self.account
 
-    #: Dipakai kalau bursa tidak memberi tahu fee taker akun -- sama dengan
-    #: fallback di paper.py dan sama dengan fee prod yang sudah terkonfirmasi.
-    FEE_FALLBACK = 0.0005
-
-    def _fee_taker(self, broker, symbol: str) -> float:
-        if symbol not in self._fee_cache:
-            fee = None
-            try:
-                fee = broker.fetch_trading_fee_pct(symbol)
-            except Exception:
-                fee = None
-            self._fee_cache[symbol] = fee if fee is not None else self.FEE_FALLBACK
-        return self._fee_cache[symbol]
+    def _fee_taker(self, broker, symbol: str) -> float | None:
+        """Tarif akun Binance; gagal = tidak diketahui, tanpa fallback/cache lama."""
+        try:
+            raw = broker.fetch_trading_fee_pct(symbol)
+            if isinstance(raw, bool):
+                return None
+            fee = _angka(raw)
+            return fee if fee is not None and 0 <= fee < 1 else None
+        except Exception:
+            return None
 
     def refresh_once(self) -> None:
         try:
@@ -594,6 +592,8 @@ class DashboardState:
             with self.lock:
                 symbol, lookback, timeframe = self.symbol, self.lookback, self.timeframe
 
+            # Tepat satu permintaan tarif per refresh, dipakai seluruh panel.
+            fee_taker = self._fee_taker(broker, symbol)
             balance = broker.fetch_balance()
             usdt = balance.get("USDT", {})
             wallet = float(usdt.get("total") or 0.0)
@@ -634,7 +634,7 @@ class DashboardState:
                 except Exception:
                     raw_positions = []
                 pnl_berjalan = hitung_pnl_berjalan(
-                    raw_positions, position, price, self._fee_taker(broker, symbol))
+                    raw_positions, position, price, fee_taker)
 
             bars = broker.fetch_recent_bars(symbol, timeframe, limit=lookback + 1)
             channel = compute_channel([b["close"] for b in bars], lookback)
@@ -648,7 +648,6 @@ class DashboardState:
                 atr = compute_atr(bars, ATR_PERIOD)
             except Exception:
                 atr = None
-            fee_taker = self._fee_taker(broker, symbol)
 
             # SL/TP yang BENAR-BENAR ada di bursa untuk posisi ini -- supaya
             # tidak perlu membuka Binance untuk memastikan posisi terlindungi.
@@ -677,6 +676,10 @@ class DashboardState:
                     "position": position, "channel": channel,
                     "pnl_berjalan": pnl_berjalan,
                     "atr": atr, "atr_period": ATR_PERIOD, "fee_taker": fee_taker,
+                    "fee_status": "ok" if fee_taker is not None else "gagal",
+                    "fee_source": "binance" if fee_taker is not None else None,
+                    "fee_error": None if fee_taker is not None else
+                        "Gagal mengambil tarif fee dari Binance. Tidak memakai asumsi; mencoba lagi pada refresh berikutnya.",
                     "bracket_orders": bracket_orders,
                     "leverage_terakhir": round(self._last_leverage) if self._last_leverage else None,
                     "history_days": self.history_days,
@@ -686,10 +689,15 @@ class DashboardState:
                 }
         except Exception as e:
             with self.lock:
+                old_pnl = self.snapshot.get("pnl_berjalan")
                 self.snapshot = {
                     **self.snapshot, "status": "galat",
                     "last_error": f"{type(e).__name__}: {e}",
                     "last_update": datetime.now(timezone.utc).isoformat(),
+                    "fee_taker": None, "fee_status": "gagal", "fee_source": None,
+                    "fee_error": "Gagal memperbarui data Binance; tarif fee tidak terverifikasi.",
+                    "pnl_berjalan": {**old_pnl, "fee_pct": None, "fee_total": None,
+                                     "bersih_setelah_fee": None} if old_pnl else None,
                 }
 
     def loop(self) -> None:
@@ -1033,6 +1041,7 @@ function set7Hari() {
 let hargaTerakhir = null;
 let leverageTerakhir = null;
 let atrTerakhir = null, feeTerakhir = null, periodeAtr = 20;
+let feeStatus = "memuat", snapshotTerakhir = {};
 
 // Pratinjau SL/TP berbasis ROI KOTOR terhadap margin -- RUMUS SAMA dengan
 // compute_bracket_roi() di paper.py (diuji angka per angka di smoke test).
@@ -1078,14 +1087,22 @@ function hitungSlTp() {
   }
   const tpH = +pilih("c_tp_roi").value, slH = +pilih("c_sl_roi").value;
   const amt = parseFloat(pilih("c_amount").value);
-  if (!amt || !hargaTerakhir || feeTerakhir === null) { el.innerHTML = "&mdash;"; return; }
+  if (feeTerakhir === null) {
+    el.innerHTML = feeStatus === "memuat"
+      ? "Memuat tarif fee dari Binance..."
+      : '<b class="merah-t">Gagal mengambil tarif fee dari Binance.</b> '
+        + 'Estimasi fee, profit bersih, dan rasio impas tidak tersedia. Tidak memakai asumsi; mencoba lagi saat refresh.';
+    return;
+  }
+  if (!amt || !hargaTerakhir) { el.innerHTML = "&mdash;"; return; }
   // Pratinjau memakai leverage yang AKAN diset bot (field Leverage).
   const asumsi = false, lev = Math.max(1, Math.round(+pilih("c_leverage").value || 1));
   const tp = keRoi(tpH), sl = keRoi(slH);
   const p = pratinjauROI(hargaTerakhir, amt, lev, feeTerakhir, tp, sl);
   const u = v => v.toFixed(2), pc = (v, d=2) => v.toFixed(d);
   let h = `Leverage <b>${lev}x</b>${asumsi ? " (asumsi, belum terbaca dari bursa)" : ""} &middot; `
-    + `margin ${u(p.margin)} USDT &middot; fee ${pc(feeTerakhir*100,3)}%/sisi = ${u(p.biaya)} USDT bolak-balik `
+    + `margin ${u(p.margin)} USDT &middot; tarif taker dari Binance ${pc(feeTerakhir*100,3)}%/sisi `
+    + `&rarr; estimasi fee ${u(p.biaya)} USDT bolak-balik `
     + `(setara ROI ${pc(p.roiFee)}%).<br>`;
   if (p.untungBersih > 0) {
     h += `<b class="hijau-t">TP +${tpH}% dari posisi</b> (ROI +${pc(tp,1)}% dari margin) &rarr; untung kotor +${u(p.untungKotor)}, `
@@ -1421,6 +1438,7 @@ function ketModeTp() {
 }
 
 function render(d) {
+  snapshotTerakhir = d;
   pilih("jam").textContent = "diperbarui " + (d.last_update ? new Date(d.last_update).toLocaleTimeString("id-ID") : "?")
     + (d.n_trades_loaded !== undefined ? ` · ${d.n_trades_loaded} fill dimuat (${d.history_days} hari terakhir)` : "");
 
@@ -1429,7 +1447,10 @@ function render(d) {
   if (typeof d.price === "number") hargaTerakhir = d.price;
   leverageTerakhir = (d.position && d.position.leverage) ? d.position.leverage : null;
   if (typeof d.atr === "number") atrTerakhir = d.atr;
-  if (typeof d.fee_taker === "number") feeTerakhir = d.fee_taker;
+  // Selalu timpa, termasuk saat null/galat: jangan pertahankan tarif lama.
+  feeTerakhir = d.status !== "galat" && d.fee_status === "ok" && d.fee_source === "binance"
+    && Number.isFinite(d.fee_taker) && d.fee_taker >= 0 && d.fee_taker < 1 ? d.fee_taker : null;
+  feeStatus = feeTerakhir !== null ? "ok" : (d.status === "memuat" ? "memuat" : "gagal");
   if (d.atr_period) periodeAtr = d.atr_period;
   leverageAcuan = leverageTerakhir || d.leverage_terakhir || null;
   hitungNotional();
@@ -1449,6 +1470,10 @@ function render(d) {
   if (d.status === "galat") {
     h += `<div class="err"><b>Gagal ambil data bursa:</b> <span class="mono">${d.last_error||"?"}</span><br>
           Angka di bawah snapshot TERAKHIR yang berhasil, bukan kondisi sekarang.</div>`;
+  }
+  if (feeStatus === "gagal") {
+    h += '<div class="warn"><b>Gagal mengambil tarif fee dari Binance.</b> '
+      + 'Estimasi biaya dan profit bersih posisi tidak tersedia; tidak memakai asumsi fee.</div>';
   }
   if (d.agg && d.agg.n_fee_unknown > 0) {
     h += `<div class="warn"><b>Perhatian:</b> ${d.agg.n_fee_unknown} dari ${d.agg.n_fills} fill tidak punya
@@ -1493,6 +1518,8 @@ function render(d) {
   // tidak perlu membuka Binance hanya untuk mengecek posisi sedang untung
   // atau rugi.
   const pb = d.pnl_berjalan;
+  const feePosisiTersedia = feeTerakhir !== null && Number.isFinite(pb?.bersih_setelah_fee)
+    && Number.isFinite(pb?.fee_total);
   const ang = v => { const dp = Math.abs(v) < 1 ? 3 : 2;
     return (v >= 0 ? "+" : "\u2212") + Math.abs(v).toFixed(dp); };
   const wr = v => v >= 0 ? "hijau-t" : "merah-t";
@@ -1510,8 +1537,11 @@ function render(d) {
         <div class="val ${wr(pb.pnl)}">${pb.roi_pct !== null ? (pb.roi_pct >= 0 ? "+" : "\u2212") + Math.abs(pb.roi_pct * 100).toFixed(2) + "%" : "&mdash;"}</div>
         <div class="note">margin ${pb.margin_awal ? pb.margin_awal.toFixed(2) : "?"} USDT${pb.leverage ? " &middot; " + pb.leverage.toFixed(0) + "x" : ""}</div></div>
       <div class="item"><div class="label">Kalau ditutup sekarang</div>
-        <div class="val ${wr(pb.bersih_setelah_fee)}">${ang(pb.bersih_setelah_fee)} USDT</div>
-        <div class="note">perkiraan setelah fee ${pb.fee_total.toFixed(3)} USDT</div></div>
+        <div class="val ${feePosisiTersedia ? wr(pb.bersih_setelah_fee) : ""}">${
+          feePosisiTersedia ? ang(pb.bersih_setelah_fee) + " USDT" : "&mdash;"}</div>
+        <div class="note">${feePosisiTersedia
+          ? "perkiraan setelah fee " + pb.fee_total.toFixed(3) + " USDT (tarif Binance)"
+          : "Estimasi bersih tidak tersedia: tarif fee Binance gagal dibaca."}</div></div>
       <div class="item"><div class="label">Pergerakan harga</div>
         <div class="val">${pb.gerak_harga_pct !== null ? ang(pb.gerak_harga_pct * 100) + "%" : "&mdash;"}</div>
         <div class="note">${pb.side.toUpperCase()} ${pb.entry.toFixed(2)} &rarr; ${pb.harga_acuan ? pb.harga_acuan.toFixed(2) : "?"} (${pb.acuan})</div></div>
@@ -1625,8 +1655,16 @@ async function muat() {
     let url = "/api?";
     if (from_ms) url += "from_ms=" + from_ms + "&";
     if (to_ms) url += "to_ms=" + to_ms;
-    render(await (await fetch(url)).json());
-  } catch (e) { pilih("jam").textContent = "gagal menghubungi dashboard: " + e; }
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const data = await response.json();
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Respons API tidak valid");
+    render(data);
+  } catch (e) {
+    render({...snapshotTerakhir, status: "galat",
+      last_error: "Gagal menghubungi dashboard atau respons API tidak valid.",
+      fee_taker: null, fee_status: "gagal", fee_source: null});
+  }
 }
 muat();
 setInterval(muat, 5000);
