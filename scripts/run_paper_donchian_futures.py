@@ -199,6 +199,43 @@ def use_price_pct_brackets() -> None:
     paper_module.compute_bracket_roi = by_price
 
 
+def install_regime_entry_gate(runner: PaperRunner, regime_strategy: RegimeFilteredStrategy) -> None:
+    """
+    Pintu terakhir sebelum order PEMBUKA posisi: regime di candle SAAT INI harus
+    TREND searah (LONG -> TREND_UP, SHORT -> TREND_DOWN). Kalau tidak:
+      - dari FLAT        -> tidak ada order, tetap FLAT, dicek lagi candle berikutnya;
+      - pembalikan arah  -> posisi lama TETAP ditutup, tapi tidak membuka arah baru.
+    Menutup posisi (target FLAT) tidak pernah ditahan.
+
+    Kenapa perlu: filter di RegimeFilteredStrategy memberi izin per "run" sinyal
+    (begitu regime pernah cocok, izin berlaku sampai sinyal berganti). Eksekusi
+    yang datang BELAKANGAN di run itu -- langkah ke-2 pembalikan arah, masuk
+    lagi setelah TP/SL (midline), atau bot baru start -- bisa terjadi saat
+    regime sudah TRANSITION/SIDEWAYS. Gerbang ini menutup celah itu.
+    """
+    asli = runner._handle_signal_change
+    butuh = {Position.LONG: "TREND_UP", Position.SHORT: "TREND_DOWN"}
+
+    async def gated(new_position, df=None, override_price=None):
+        if new_position == Position.FLAT or df is None:
+            return await asli(new_position, df, override_price=override_price)
+        try:
+            sekarang = str(regime_strategy.regime_series(df).iloc[-1])
+        except Exception as e:
+            print(f"  [regime] gagal membaca regime ({e}) -- entry DITAHAN demi aman")
+            sekarang = "?"
+        if sekarang == butuh.get(new_position):
+            return await asli(new_position, df, override_price=override_price)
+        arah = "LONG" if new_position == Position.LONG else "SHORT"
+        if runner._current_position not in (Position.FLAT, new_position):
+            print(f"  [regime] sinyal berbalik ke {arah} tapi regime {sekarang} -- posisi lama DITUTUP, "
+                  f"entry {arah} ditahan sampai regime {butuh[new_position]}")
+            return await asli(Position.FLAT, df, override_price=override_price)
+        print(f"  [regime] entry {arah} DITAHAN -- regime {sekarang}, butuh {butuh[new_position]}")
+
+    runner._handle_signal_change = gated
+
+
 def _resolve_account_or_exit() -> dict:
     """Akun dari TRADING_ACCOUNT di .env.bot -- tanpa default (lihat src/execution/account.py)."""
     try:
@@ -363,7 +400,7 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         from src.strategy.regime_filtered import tf_minutes
         install_paged_backfill(broker, tf_minutes(args.timeframe))
 
-    return PaperRunner(
+    runner = PaperRunner(
         strategy, broker, symbol=args.symbol, timeframe=args.timeframe,
         order_amount=args.amount, use_reduce_only=True,  # futures -- reduceOnly relevan, beda dari spot
         session_hours=args.session_hours, min_entry_buffer_hours=args.min_entry_buffer_hours,
@@ -381,6 +418,10 @@ def build_runner(args: argparse.Namespace) -> PaperRunner:
         max_consecutive_sl=getattr(args, "max_consecutive_sl", None),
         max_daily_loss_pct=getattr(args, "max_daily_loss_pct", None),
     )
+    if regime_strategy is not None:
+        install_regime_entry_gate(runner, regime_strategy)
+        print("  (Gerbang regime AKTIF: order pembuka posisi hanya saat regime candle ini TREND searah)")
+    return runner
 
 
 def main() -> None:
