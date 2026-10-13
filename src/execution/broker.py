@@ -422,7 +422,78 @@ class Broker:
         return float(ticker["last"])
 
     def fetch_balance(self) -> dict:
-        return self.exchange.fetch_balance()
+        """
+        Saldo akun. Untuk futures USD-M (binanceusdm), entri "USDT" DIISI
+        dengan angka TINGKAT AKUN dari Binance -- lihat _account_totals().
+
+        Kenapa: ccxt mengisi balance["USDT"] dengan saldo ASET USDT saja.
+        Kalau jaminan akun berupa aset lain (Multi-Assets Mode: USDC, BNB,
+        BTC, dst.), aset USDT cuma berisi realized PnL dari BTCUSDT -- jadi
+        "saldo" terbaca sebesar profit (mis. 0.58), padahal modal sebenarnya
+        jauh lebih besar. Dashboard, cek akun, dan kill switch rugi harian
+        yang memakai angka ini jadi salah total.
+
+        Angka asli aset USDT tetap ada di balance["USDT_ASET"]; angka tingkat
+        akun lengkap di balance["AKUN"]. Kalau respons Binance tidak memuat
+        angka tingkat akun, balance dikembalikan APA ADANYA (perilaku lama).
+        """
+        balance = self.exchange.fetch_balance()
+        if self.exchange_id != "binanceusdm":
+            return balance
+        akun = self._account_totals(balance)
+        if akun is None:
+            return balance
+        balance["USDT_ASET"] = dict(balance.get("USDT") or {})
+        balance["USDT"] = {"free": akun["available"], "used": akun["used"], "total": akun["wallet"]}
+        balance["AKUN"] = akun
+        return balance
+
+    @staticmethod
+    def _account_totals(balance: dict) -> dict | None:
+        """
+        Angka tingkat akun futures dari respons Binance (/fapi/v2|v3/account)
+        yang sudah dibawa ccxt di balance["info"]. Dalam USD, SAMA dengan yang
+        tampil di aplikasi Binance (Futures > Assets):
+          wallet    = totalWalletBalance  (Wallet Balance)
+          margin    = totalMarginBalance  (wallet + unrealized PnL)
+          available = availableBalance    (bisa dipakai buka posisi baru)
+          used      = totalInitialMargin  (margin terkunci posisi + order)
+        Return None kalau field wajibnya tidak ada atau tidak bisa dibaca.
+        """
+        info = balance.get("info")
+        if not isinstance(info, dict):
+            return None
+
+        def angka(key):
+            v = info.get(key)
+            if v in (None, ""):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        wallet, available = angka("totalWalletBalance"), angka("availableBalance")
+        if wallet is None or available is None:
+            return None
+        aset = {}
+        for a in info.get("assets") or []:
+            try:
+                wb = float(a.get("walletBalance") or 0)
+            except (TypeError, ValueError):
+                continue
+            if wb:
+                aset[a.get("asset")] = wb
+        multi = info.get("multiAssetsMargin")
+        return {
+            "wallet": wallet,
+            "margin": angka("totalMarginBalance"),
+            "available": available,
+            "used": angka("totalInitialMargin") or 0.0,
+            "unrealized": angka("totalUnrealizedProfit"),
+            "multi_assets": multi in (True, "true", "True"),
+            "aset": aset,
+        }
 
     def fetch_free_balance(self, asset: str) -> float:
         balance = self.fetch_balance()
